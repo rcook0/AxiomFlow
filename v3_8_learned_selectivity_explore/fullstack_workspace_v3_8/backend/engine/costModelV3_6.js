@@ -1,0 +1,161 @@
+const crypto = require("crypto");
+
+function sha1(s){ return crypto.createHash("sha1").update(String(s)).digest("hex"); }
+
+function joinSigFromOnRef(onRef){
+  const preds = (onRef || []).map(p => {
+    const a = `${p.left.rel}:${p.left.path||""}`;
+    const b = `${p.right.rel}:${p.right.path||""}`;
+    if (a <= b) return { l: a, r: b };
+    return { l: b, r: a };
+  });
+  preds.sort((x,y)=> (x.l+x.r).localeCompare(y.l+y.r));
+  return sha1(JSON.stringify(preds));
+}
+
+function joinSigFromOn(on){
+  const pairs = (on || []).map(([l,r])=>({l:String(l), r:String(r)}));
+  pairs.sort((a,b)=> (a.l+a.r).localeCompare(b.l+b.r));
+  return sha1(JSON.stringify(pairs));
+}
+
+function buildMaps(plan){
+  const nodes = plan.nodes || [];
+  const edges = plan.edges || [];
+  const nodeById = new Map(nodes.map(n=>[n.id,n]));
+  const out = new Map();
+  const inc = new Map();
+  for (const e of edges) {
+    if (!out.has(e.from)) out.set(e.from, []);
+    out.get(e.from).push(e);
+    if (!inc.has(e.to)) inc.set(e.to, []);
+    inc.get(e.to).push(e);
+  }
+  return { nodeById, out, inc };
+}
+
+function topoSort(plan){
+  const { nodeById, out, inc } = buildMaps(plan);
+  const indeg = new Map();
+  for (const id of nodeById.keys()) indeg.set(id, 0);
+  for (const [to, arr] of inc.entries()) indeg.set(to, (indeg.get(to)||0) + arr.length);
+
+  const q = [];
+  for (const [id, d] of indeg.entries()) if (d === 0) q.push(id);
+
+  const order = [];
+  while (q.length) {
+    const id = q.shift();
+    order.push(id);
+    for (const e of (out.get(id) || [])) {
+      const t = e.to;
+      indeg.set(t, (indeg.get(t)||0) - 1);
+      if (indeg.get(t) === 0) q.push(t);
+    }
+  }
+  return order;
+}
+
+function statRows(st){
+  if (!st) return null;
+  return (st.emaRowsOut ?? st.emaRowsIn ?? null);
+}
+
+function estimateJoinOut(leftRows, rightRows, joinSigStatsDoc){
+  if (joinSigStatsDoc) {
+    const fL = joinSigStatsDoc.emaFanoutPerLeft ?? null;
+    const fR = joinSigStatsDoc.emaFanoutPerRight ?? null;
+    const ests = [];
+    if (fL != null) ests.push(fL * leftRows);
+    if (fR != null) ests.push(fR * rightRows);
+    if (ests.length === 2) return Math.sqrt(ests[0] * ests[1]);
+    if (ests.length === 1) return ests[0];
+  }
+  return Math.min(leftRows, rightRows);
+}
+
+function estimatePlanCostV3_6(plan, statsByNodeId, joinSigStats, opts){
+  const s = statsByNodeId || new Map();
+  const js = joinSigStats || new Map();
+  const { nodeById, inc } = buildMaps(plan);
+  const topo = topoSort(plan);
+
+  const rowsByNode = new Map();
+  const costByNode = new Map();
+
+  function inputRows(nodeId, port) {
+    const inE = (inc.get(nodeId) || []).filter(e => (e.port || "in") === (port || "in"));
+    if (inE.length === 0) return 0;
+    const fromId = inE[0].from;
+    return rowsByNode.get(fromId) ?? (statRows(s.get(fromId)) ?? 1000);
+  }
+
+  for (const id of topo) {
+    const n = nodeById.get(id);
+    if (!n) continue;
+
+    if (n.op === "scan") {
+      const est = statRows(s.get(id)) ?? n.params?.estimatedRows ?? 10000;
+      rowsByNode.set(id, est);
+      costByNode.set(id, est);
+      continue;
+    }
+
+    if (n.op === "filter") {
+      const inRows = inputRows(id, "in");
+      const sel = (s.get(id)?.emaSelectivity ?? n.params?.estimatedSelectivity ?? (opts?.defaultFilterSelectivity ?? 0.3));
+      const outRows = Math.max(0, Math.floor(inRows * sel));
+      rowsByNode.set(id, outRows);
+      costByNode.set(id, inRows);
+      continue;
+    }
+
+    if (n.op === "project" || n.op === "materialize" || n.op === "sink") {
+      const inRows = inputRows(id, "in");
+      rowsByNode.set(id, inRows);
+      costByNode.set(id, inRows);
+      continue;
+    }
+
+    if (n.op === "join") {
+      const leftRows = inputRows(id, "left");
+      const rightRows = inputRows(id, "right");
+      const sig = n.params?.onRef ? joinSigFromOnRef(n.params.onRef) : joinSigFromOn(n.params?.on || []);
+      const sigDoc = sig ? js.get(sig) : null;
+      const outRows = estimateJoinOut(leftRows, rightRows, sigDoc);
+      rowsByNode.set(id, outRows);
+
+      const algo = n.params?.algorithm || "hash";
+      const build = n.params?.build || (rightRows <= leftRows ? "right" : "left");
+      const memBudget = opts?.hashBuildBudgetRows ?? 200000;
+      const penalty = opts?.hashBuildOverBudgetPenalty ?? 10;
+
+      let cost = 0;
+      if (algo === "nested_loop") {
+        const inner = Math.min(leftRows, rightRows);
+        const outer = Math.max(leftRows, rightRows);
+        cost = outer * inner;
+      } else {
+        const buildRows = build === "left" ? leftRows : rightRows;
+        const over = buildRows > memBudget ? (buildRows - memBudget) / memBudget : 0;
+        const memPenalty = over > 0 ? (1 + over * penalty) : 1;
+        cost = (leftRows + rightRows + outRows) * memPenalty;
+      }
+
+      costByNode.set(id, cost);
+      continue;
+    }
+
+    // default
+    const inRows = inputRows(id, "in");
+    rowsByNode.set(id, inRows);
+    costByNode.set(id, inRows);
+  }
+
+  let total = 0;
+  for (const v of costByNode.values()) total += v;
+
+  return { rowsByNode, costByNode, totalCost: total };
+}
+
+module.exports = { estimatePlanCostV3_6, joinSigFromOnRef, joinSigFromOn };
